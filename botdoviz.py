@@ -1,3 +1,4 @@
+
 import os
 import asyncio
 import logging
@@ -9,138 +10,260 @@ import discord
 from flask import Flask
 from discord.ext import tasks
 
-# Canlı veri için borsapy kütüphanesi
-try:
-    from borsapy import doviz, altin, borsa, kripto
-except ImportError:
-    raise SystemExit("Lütfen önce 'pip install borsapy' komutunu çalıştırın.")
-
 # =========================================================
 # AYARLAR
 # =========================================================
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+MESSAGE_ID_ENV = os.getenv("MESSAGE_ID", "").strip()
 TZ = ZoneInfo("Europe/Istanbul")
 REFRESH_SECONDS = 60
 MESSAGE_ID_FILE = "message_id.txt"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 log = logging.getLogger("canlidoviz")
 
 # =========================================================
-# FLASK (Render / UptimeRobot için keep-alive)
+# BORSA.PY
+# =========================================================
+try:
+    from borsapy import doviz, altin, borsa, kripto
+    BORSAPY_AVAILABLE = True
+except ImportError:
+    doviz = altin = borsa = kripto = None
+    BORSAPY_AVAILABLE = False
+    log.exception("borsapy import edilemedi. requirements.txt dosyasını kontrol et.")
+
+
+# =========================================================
+# VARLIK LİSTESİ
+# =========================================================
+ASSET_MAP = {
+    "💵 USD/TRY": ("doviz", "USD"),
+    "💶 EUR/TRY": ("doviz", "EUR"),
+    "💷 GBP/TRY": ("doviz", "GBP"),
+    "💴 JPY/TRY": ("doviz", "JPY"),
+    "🇨🇭 CHF/TRY": ("doviz", "CHF"),
+    "🇨🇦 CAD/TRY": ("doviz", "CAD"),
+    "🇦🇺 AUD/TRY": ("doviz", "AUD"),
+    "🪙 Gram Altın": ("altin", "gram-altin"),
+    "🪙 Çeyrek Altın": ("altin", "ceyrek-altin"),
+    "🪙 Yarım Altın": ("altin", "yarim-altin"),
+    "🪙 Tam Altın": ("altin", "tam-altin"),
+    "🪙 ONS Altın": ("altin", "ons-altin"),
+    "📈 BIST 100": ("borsa", "XU100"),
+    "✈️ THYAO": ("borsa", "THYAO"),
+    "🏦 GARAN": ("borsa", "GARAN"),
+    "₿ BTC/USDT": ("kripto", "BTCUSDT"),
+    "Ξ ETH/USDT": ("kripto", "ETHUSDT"),
+}
+
+# =========================================================
+# FLASK / RENDER
 # =========================================================
 app = Flask(__name__)
 
+
 @app.route("/")
 def home():
-    return "OK"
+    return "Doviz bot is running."
+
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}, 200
+
 
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        use_reloader=False,
+    )
+
 
 # =========================================================
-# VERİ ÇEKME FONKSİYONLARI (Kapsamlı)
+# FİYAT YARDIMCILARI
 # =========================================================
-def get_single_price(asset_type, symbol):
-    """borsapy kütüphanesini kullanarak anlık fiyatı çeker."""
-    try:
-        if asset_type == "doviz":
-            # Döviz kurları (USD, EUR, GBP vb.)
-            data = doviz.get_current(symbol)
-            return f"{data['Satış']:.4f}".replace(".", ",")
-        elif asset_type == "altin":
-            # Altın fiyatları (gram-altin, ceyrek-altin vb.)
-            data = altin.get_current(symbol)
-            return f"{data['Satış']:,.2f}".replace(".", ",").replace(",", ".")
-        elif asset_type == "borsa":
-            # Borsa İstanbul (XU100, THYAO vb.)
-            data = borsa.get_current(symbol)
-            return f"{data['Son']:,.2f}".replace(".", ",").replace(",", ".")
-        elif asset_type == "kripto":
-            # Kripto Paralar (BTC, ETH vb.)
-            data = kripto.get_current(symbol)
-            return f"{data['Satış']:,.2f}".replace(".", ",").replace(",", ".")
-    except Exception as e:
-        log.warning(f"{symbol} verisi çekilemedi: {e}")
-        return None
+def get_field(data, *keys):
+    """Sözlük veya pandas benzeri sonuçtan alan okumayı dener."""
+    for key in keys:
+        try:
+            value = data[key]
+            if value is not None:
+                return value
+        except (KeyError, TypeError, IndexError, AttributeError):
+            pass
+
+        try:
+            value = getattr(data, key)
+            if value is not None:
+                return value
+        except (AttributeError, TypeError):
+            pass
+
     return None
 
+
+def to_number(value):
+    """Fiyat değerini güvenli biçimde float'a çevirir."""
+    if value is None:
+        return None
+
+    try:
+        # Pandas/NumPy skalerleri için de çalışır.
+        number = float(value)
+        if number > 0 and number != float("inf"):
+            return number
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    return None
+
+
+def format_price(value, asset_type):
+    """Fiyatı Türkçe sayı biçiminde gösterir."""
+    if asset_type == "doviz":
+        decimals = 4
+    elif asset_type == "borsa":
+        decimals = 2
+    else:
+        decimals = 2
+
+    formatted = f"{value:,.{decimals}f}"
+    return formatted.replace(",", "_").replace(".", ",").replace("_", ".")
+
+
+def get_single_price(asset_type, symbol):
+    """borsapy üzerinden tek varlığın son/satış fiyatını alır."""
+    if not BORSAPY_AVAILABLE:
+        return None
+
+    try:
+        if asset_type == "doviz":
+            data = doviz.get_current(symbol)
+            raw = get_field(data, "Satış", "Satis", "satış", "sell", "last")
+
+        elif asset_type == "altin":
+            data = altin.get_current(symbol)
+            raw = get_field(data, "Satış", "Satis", "satış", "sell", "last")
+
+        elif asset_type == "borsa":
+            data = borsa.get_current(symbol)
+            raw = get_field(data, "Son", "son", "Close", "close", "last")
+
+        elif asset_type == "kripto":
+            data = kripto.get_current(symbol)
+            raw = get_field(data, "Satış", "Satis", "satış", "sell", "last")
+
+        else:
+            return None
+
+        number = to_number(raw)
+
+        if number is None:
+            log.warning("%s için geçerli fiyat alanı bulunamadı.", symbol)
+            return None
+
+        return format_price(number, asset_type)
+
+    except Exception:
+        log.exception("%s fiyatı alınamadı.", symbol)
+        return None
+
+
 async def fetch_all():
-    """Tüm varlıkları asenkron olarak toplar (borsapy senkron olduğu için to_thread kullanılır)."""
-    
-    # Kapsamlı Varlık Listesi
-    ASSET_MAP = {
-        "💵 USD/TRY": ("doviz", "USD"),
-        "💶 EUR/TRY": ("doviz", "EUR"),
-        "💷 GBP/TRY": ("doviz", "GBP"),
-        "💴 JPY/TRY": ("doviz", "JPY"),
-        "🪙 Gram Altın": ("altin", "gram-altin"),
-        "🪙 Çeyrek Altın": ("altin", "ceyrek-altin"),
-        "🪙 Yarım Altın": ("altin", "yarim-altin"),
-        "🪙 Tam Altın": ("altin", "tam-altin"),
-        "🪙 ONS Altın": ("altin", "ons-altin"),
-        "📈 BIST 100": ("borsa", "XU100"),
-        "✈️ THYAO": ("borsa", "THYAO"),
-        "🏦 GARAN": ("borsa", "GARAN"),
-        "₿ BTC/USDT": ("kripto", "BTCUSDT"),
-        "Ξ ETH/USDT": ("kripto", "ETHUSDT"),
-    }
-
-    async def task_wrapper(name, atype, sym):
-        price = await asyncio.to_thread(get_single_price, atype, sym)
-        return name, price
-
+    """Senkron fiyat sorgularını event loop dışında çalıştırır."""
     results = await asyncio.gather(
-        *(task_wrapper(name, atype, sym) for name, (atype, sym) in ASSET_MAP.items())
+        *[
+            asyncio.to_thread(get_single_price, asset_type, symbol)
+            for asset_type, symbol in ASSET_MAP.values()
+        ],
+        return_exceptions=True,
     )
-    return dict(results)
+
+    prices = {}
+
+    for name, result in zip(ASSET_MAP.keys(), results):
+        if isinstance(result, Exception):
+            log.error("%s fiyat sorgusu başarısız: %s", name, result)
+            prices[name] = None
+        else:
+            prices[name] = result
+
+    return prices
+
 
 # =========================================================
-# EMBED (TABLO) OLUŞTURMA
+# DISCORD TABLOSU
 # =========================================================
-def build_embed(prices: dict, updated_at: datetime):
+def build_embed(prices, updated_at=None):
+    updated_at = updated_at or datetime.now(TZ)
+
     embed = discord.Embed(
         title="💹 Canlı Piyasa Fiyatları",
-        description="Aşağıdaki tablo **60 saniyede bir** otomatik güncellenir.",
-        color=discord.Color.green(),
+        description=(
+            "Anlık fiyat tablosu\n"
+            "Otomatik güncelleme: **60 saniye**"
+        ),
+        color=discord.Color.blue(),
+        timestamp=updated_at,
     )
-    
-    for name, price in prices.items():
-        # Sadece anlık fiyat gösterilir, artış/düşüş YOK.
-        value = f"**{price}**" if price else "`Veri Bekleniyor...`"
-        embed.add_field(name=name, value=value, inline=True)
+
+    for name in ASSET_MAP:
+        price = prices.get(name)
+        value = f"**{price}**" if price else "`Veri alınamadı`"
+
+        embed.add_field(
+            name=name,
+            value=value,
+            inline=True,
+        )
 
     embed.set_footer(
-        text=f"Son güncelleme: {updated_at.strftime('%d.%m.%Y %H:%M:%S')} • {TZ.key} | Kaynak: canlidoviz.com"
+        text="Son güncelleme: "
+        + updated_at.strftime("%d.%m.%Y %H:%M:%S")
+        + " • Europe/Istanbul"
     )
+
     return embed
 
+
 # =========================================================
-# GÜNCELLE BUTONU (Mesaj Atmaz, Sadece Tabloyu Günceller)
+# GÜNCELLE BUTONU
 # =========================================================
 class RefreshView(discord.ui.View):
-    def __init__(self, bot: "PriceBot"):
+    def __init__(self, bot):
         super().__init__(timeout=None)
         self.bot = bot
 
     @discord.ui.button(
-        label="🔄 Güncelle",
+        label="Güncelle",
+        emoji="🔄",
         style=discord.ButtonStyle.primary,
-        custom_id="refresh_canlidoviz_btn",
+        custom_id="refresh_canlidoviz_btn_v2",
     )
-    async def refresh_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        # Discord'a "tıklandı" bilgisi gider ama kullanıcıya hiçbir görünür mesaj (ephemeral vb.) atılmaz.
+    async def refresh_btn(self, interaction, button):
+        # Kullanıcıya yeni mesaj göndermez.
         await interaction.response.defer()
-        
-        prices = await fetch_all()
-        embed = build_embed(prices, datetime.now(TZ))
-        
+
         try:
-            # Sadece ana mesajın embed'ini düzenle
-            await interaction.message.edit(embed=embed, view=self)
-        except Exception as e:
-            log.warning(f"Embed düzenlenemedi: {e}")
+            async with self.bot.refresh_lock:
+                prices = await fetch_all()
+                embed = build_embed(prices)
+
+                await interaction.message.edit(
+                    embed=embed,
+                    view=self,
+                )
+
+        except Exception:
+            log.exception("Butonla güncelleme başarısız oldu.")
+            # Hata durumunda da kanala mesaj atılmaz.
+
 
 # =========================================================
 # BOT
@@ -148,84 +271,142 @@ class RefreshView(discord.ui.View):
 class PriceBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
-        self.message_id = None
-        self._load_message_id()
+        self.message_id = self._load_message_id()
+        self.refresh_lock = asyncio.Lock()
+        self.ready_once = False
 
     def _load_message_id(self):
+        if MESSAGE_ID_ENV.isdigit():
+            return int(MESSAGE_ID_ENV)
+
         try:
-            if os.path.exists(MESSAGE_ID_FILE):
-                with open(MESSAGE_ID_FILE) as f:
-                    v = f.read().strip()
-                    self.message_id = int(v) if v else None
-        except Exception:
-            self.message_id = None
+            with open(MESSAGE_ID_FILE, "r", encoding="utf-8") as file:
+                value = file.read().strip()
+                return int(value) if value.isdigit() else None
+        except (OSError, ValueError):
+            return None
 
     def _save_message_id(self):
         try:
-            with open(MESSAGE_ID_FILE, "w") as f:
-                f.write(str(self.message_id or ""))
-        except Exception:
-            pass
+            with open(MESSAGE_ID_FILE, "w", encoding="utf-8") as file:
+                file.write(str(self.message_id or ""))
+        except OSError:
+            log.warning("Mesaj ID dosyası kaydedilemedi.")
 
     async def on_ready(self):
-        log.info(f"Giriş yapıldı: {self.user}")
-        self.add_view(RefreshView(self))  # Butonun bot yeniden başlasa bile çalışmasını sağlar
-        await self.ensure_message()
-        self.auto_refresh.start()
+        log.info("Discord bağlantısı kuruldu: %s", self.user)
 
-    async def ensure_message(self):
-        channel = self.get_channel(CHANNEL_ID)
-        if not channel:
-            log.error("CHANNEL_ID geçersiz / kanal bulunamadı!")
+        if self.ready_once:
             return
 
-        prices = await fetch_all()
-        embed = build_embed(prices, datetime.now(TZ))
+        self.ready_once = True
+        self.add_view(RefreshView(self))
+
+        await self.ensure_message()
+
+        if not self.auto_refresh.is_running():
+            self.auto_refresh.start()
+
+    async def ensure_message(self):
+        if CHANNEL_ID == 0:
+            log.error("CHANNEL_ID ortam değişkeni ayarlanmamış.")
+            return
+
+        channel = self.get_channel(CHANNEL_ID)
+
+        if channel is None:
+            try:
+                channel = await self.fetch_channel(CHANNEL_ID)
+            except Exception:
+                log.exception("Discord kanalı bulunamadı.")
+                return
+
+        try:
+            prices = await fetch_all()
+            embed = build_embed(prices)
+        except Exception:
+            log.exception("İlk fiyat verileri alınamadı.")
+            embed = build_embed({name: None for name in ASSET_MAP})
+
         view = RefreshView(self)
 
         if self.message_id:
             try:
-                msg = await channel.fetch_message(self.message_id)
-                await msg.edit(embed=embed, view=view)
-                log.info(f"Mevcut mesaj düzenlendi (id={self.message_id})")
+                message = await channel.fetch_message(self.message_id)
+                await message.edit(embed=embed, view=view)
+                log.info("Mevcut tablo düzenlendi: %s", self.message_id)
                 return
-            except Exception:
-                log.info("Eski mesaj bulunamadı, yenisi oluşturuluyor…")
+            except discord.NotFound:
+                log.warning("Kayıtlı mesaj silinmiş; yeni mesaj oluşturulacak.")
+            except discord.Forbidden:
+                log.exception("Mesajı düzenleme izni yok.")
+                return
+            except discord.HTTPException:
+                log.exception("Kayıtlı mesaj düzenlenemedi.")
+                return
 
-        # Eğer kayıtlı mesaj yoksa ilk defa gönderir
-        msg = await channel.send(embed=embed, view=view)
-        self.message_id = msg.id
-        self._save_message_id()
-        log.info(f"Yeni mesaj gönderildi (id={self.message_id})")
+        try:
+            message = await channel.send(embed=embed, view=view)
+            self.message_id = message.id
+            self._save_message_id()
+            log.info("İlk tablo mesajı oluşturuldu: %s", message.id)
+        except Exception:
+            log.exception("İlk tablo mesajı gönderilemedi.")
 
     @tasks.loop(seconds=REFRESH_SECONDS)
     async def auto_refresh(self):
-        """Her 60 saniyede bir tabloyu yeniler — EK MESAJ ATMAZ."""
-        try:
-            channel = self.get_channel(CHANNEL_ID)
-            if not channel or not self.message_id:
-                return
-            msg = await channel.fetch_message(self.message_id)
-            prices = await fetch_all()
-            embed = build_embed(prices, datetime.now(TZ))
-            await msg.edit(embed=embed, view=RefreshView(self))
-            log.info("Otomatik güncelleme yapıldı.")
-        except Exception as e:
-            log.warning(f"Otomatik güncelleme hatası: {e}")
+        if not self.message_id or CHANNEL_ID == 0:
+            return
+
+        async with self.refresh_lock:
+            try:
+                channel = self.get_channel(CHANNEL_ID)
+
+                if channel is None:
+                    channel = await self.fetch_channel(CHANNEL_ID)
+
+                message = await channel.fetch_message(self.message_id)
+                prices = await fetch_all()
+                embed = build_embed(prices)
+
+                await message.edit(
+                    embed=embed,
+                    view=RefreshView(self),
+                )
+
+                log.info("Mevcut tablo otomatik güncellendi.")
+
+            except discord.NotFound:
+                log.error(
+                    "Tablo mesajı bulunamadı. MESSAGE_ID değerini kontrol et."
+                )
+            except discord.Forbidden:
+                log.exception("Kanal veya mesaj için yetki eksik.")
+            except Exception:
+                log.exception("Otomatik güncelleme başarısız.")
 
     @auto_refresh.before_loop
-    async def _wait(self):
+    async def before_auto_refresh(self):
         await self.wait_until_ready()
 
+
 # =========================================================
-# ÇALIŞTIR
+# BAŞLAT
 # =========================================================
 def main():
     if not TOKEN:
-        log.error("DISCORD_TOKEN ortam değişkeni yok!")
-        return
+        raise RuntimeError(
+            "DISCORD_TOKEN Render Environment Variables bölümünde yok."
+        )
+
+    if not BORSAPY_AVAILABLE:
+        raise RuntimeError(
+            "borsapy yüklenemedi. requirements.txt dosyasına borsapy ekle."
+        )
+
     Thread(target=run_flask, daemon=True).start()
     PriceBot().run(TOKEN)
+
 
 if __name__ == "__main__":
     main()
