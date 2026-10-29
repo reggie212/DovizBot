@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from threading import Thread
 
 import discord
+import borsapy as bp
 from flask import Flask
 from discord.ext import tasks
 
@@ -16,6 +17,7 @@ from discord.ext import tasks
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 MESSAGE_ID_ENV = os.getenv("MESSAGE_ID", "").strip()
+
 TZ = ZoneInfo("Europe/Istanbul")
 REFRESH_SECONDS = 60
 MESSAGE_ID_FILE = "message_id.txt"
@@ -27,38 +29,27 @@ logging.basicConfig(
 log = logging.getLogger("canlidoviz")
 
 # =========================================================
-# BORSA.PY
-# =========================================================
-try:
-    from borsapy import doviz, altin, borsa, kripto
-    BORSAPY_AVAILABLE = True
-except ImportError:
-    doviz = altin = borsa = kripto = None
-    BORSAPY_AVAILABLE = False
-    log.exception("borsapy import edilemedi. requirements.txt dosyasını kontrol et.")
-
-
-# =========================================================
-# VARLIK LİSTESİ
+# VARLIKLAR
+# Desteklenen semboller kullanılıyor.
 # =========================================================
 ASSET_MAP = {
-    "💵 USD/TRY": ("doviz", "USD"),
-    "💶 EUR/TRY": ("doviz", "EUR"),
-    "💷 GBP/TRY": ("doviz", "GBP"),
-    "💴 JPY/TRY": ("doviz", "JPY"),
-    "🇨🇭 CHF/TRY": ("doviz", "CHF"),
-    "🇨🇦 CAD/TRY": ("doviz", "CAD"),
-    "🇦🇺 AUD/TRY": ("doviz", "AUD"),
-    "🪙 Gram Altın": ("altin", "gram-altin"),
-    "🪙 Çeyrek Altın": ("altin", "ceyrek-altin"),
-    "🪙 Yarım Altın": ("altin", "yarim-altin"),
-    "🪙 Tam Altın": ("altin", "tam-altin"),
-    "🪙 ONS Altın": ("altin", "ons-altin"),
-    "📈 BIST 100": ("borsa", "XU100"),
-    "✈️ THYAO": ("borsa", "THYAO"),
-    "🏦 GARAN": ("borsa", "GARAN"),
-    "₿ BTC/USDT": ("kripto", "BTCUSDT"),
-    "Ξ ETH/USDT": ("kripto", "ETHUSDT"),
+    "💵 USD/TRY": ("fx", "USD"),
+    "💶 EUR/TRY": ("fx", "EUR"),
+    "💷 GBP/TRY": ("fx", "GBP"),
+    "💴 JPY/TRY": ("fx", "JPY"),
+    "🇨🇭 CHF/TRY": ("fx", "CHF"),
+    "🇨🇦 CAD/TRY": ("fx", "CAD"),
+    "🇦🇺 AUD/TRY": ("fx", "AUD"),
+
+    "🪙 Gram Altın": ("fx", "gram-altin"),
+    "🪙 ONS Altın": ("fx", "ons-altin"),
+
+    "📈 BIST 100": ("index", "XU100"),
+    "✈️ THYAO": ("stock", "THYAO"),
+    "🏦 GARAN": ("stock", "GARAN"),
+
+    "₿ BTC/USDT": ("crypto", "BTCUSDT"),
+    "Ξ ETH/USDT": ("crypto", "ETHUSDT"),
 }
 
 # =========================================================
@@ -69,7 +60,7 @@ app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Doviz bot is running."
+    return "Live market price bot is running.", 200
 
 
 @app.route("/health")
@@ -88,36 +79,16 @@ def run_flask():
 # =========================================================
 # FİYAT YARDIMCILARI
 # =========================================================
-def get_field(data, *keys):
-    """Sözlük veya pandas benzeri sonuçtan alan okumayı dener."""
-    for key in keys:
-        try:
-            value = data[key]
-            if value is not None:
-                return value
-        except (KeyError, TypeError, IndexError, AttributeError):
-            pass
-
-        try:
-            value = getattr(data, key)
-            if value is not None:
-                return value
-        except (AttributeError, TypeError):
-            pass
-
-    return None
-
-
 def to_number(value):
-    """Fiyat değerini güvenli biçimde float'a çevirir."""
     if value is None:
         return None
 
     try:
-        # Pandas/NumPy skalerleri için de çalışır.
         number = float(value)
+
         if number > 0 and number != float("inf"):
             return number
+
     except (TypeError, ValueError, OverflowError):
         pass
 
@@ -125,11 +96,8 @@ def to_number(value):
 
 
 def format_price(value, asset_type):
-    """Fiyatı Türkçe sayı biçiminde gösterir."""
-    if asset_type == "doviz":
+    if asset_type == "fx":
         decimals = 4
-    elif asset_type == "borsa":
-        decimals = 2
     else:
         decimals = 2
 
@@ -138,58 +106,74 @@ def format_price(value, asset_type):
 
 
 def get_single_price(asset_type, symbol):
-    """borsapy üzerinden tek varlığın son/satış fiyatını alır."""
-    if not BORSAPY_AVAILABLE:
-        return None
+    """borsapy 0.11.x API'si ile tek fiyat alır."""
 
     try:
-        if asset_type == "doviz":
-            data = doviz.get_current(symbol)
-            raw = get_field(data, "Satış", "Satis", "satış", "sell", "last")
+        if asset_type == "fx":
+            data = bp.FX(symbol).current
 
-        elif asset_type == "altin":
-            data = altin.get_current(symbol)
-            raw = get_field(data, "Satış", "Satis", "satış", "sell", "last")
+        elif asset_type == "index":
+            data = bp.Index(symbol).info
 
-        elif asset_type == "borsa":
-            data = borsa.get_current(symbol)
-            raw = get_field(data, "Son", "son", "Close", "close", "last")
+        elif asset_type == "stock":
+            data = bp.Ticker(symbol).info
 
-        elif asset_type == "kripto":
-            data = kripto.get_current(symbol)
-            raw = get_field(data, "Satış", "Satis", "satış", "sell", "last")
+        elif asset_type == "crypto":
+            data = bp.Crypto(symbol).current
 
         else:
+            log.warning("Bilinmeyen varlık tipi: %s", asset_type)
             return None
 
-        number = to_number(raw)
+        # API yanıtındaki son fiyatı al.
+        raw = None
 
-        if number is None:
-            log.warning("%s için geçerli fiyat alanı bulunamadı.", symbol)
+        if isinstance(data, dict):
+            for key in ("last", "price", "last_price", "close"):
+                raw = to_number(data.get(key))
+                if raw is not None:
+                    break
+        else:
+            for key in ("last", "price", "last_price", "close"):
+                try:
+                    raw = to_number(getattr(data, key))
+                except (AttributeError, TypeError):
+                    raw = None
+
+                if raw is not None:
+                    break
+
+        if raw is None:
+            log.warning("%s için fiyat verisi bulunamadı.", symbol)
             return None
 
-        return format_price(number, asset_type)
+        return format_price(raw, asset_type)
 
-    except Exception:
-        log.exception("%s fiyatı alınamadı.", symbol)
+    except Exception as exc:
+        # Bir varlık hata verirse diğerleri yine alınır.
+        log.warning("%s fiyatı alınamadı: %s", symbol, exc)
         return None
 
 
 async def fetch_all():
-    """Senkron fiyat sorgularını event loop dışında çalıştırır."""
+    """Senkron borsapy çağrılarını event loop dışında yürütür."""
+
+    names = list(ASSET_MAP.keys())
+    assets = list(ASSET_MAP.values())
+
     results = await asyncio.gather(
-        *[
+        *(
             asyncio.to_thread(get_single_price, asset_type, symbol)
-            for asset_type, symbol in ASSET_MAP.values()
-        ],
+            for asset_type, symbol in assets
+        ),
         return_exceptions=True,
     )
 
     prices = {}
 
-    for name, result in zip(ASSET_MAP.keys(), results):
+    for name, result in zip(names, results):
         if isinstance(result, Exception):
-            log.error("%s fiyat sorgusu başarısız: %s", name, result)
+            log.error("%s sorgusu başarısız: %s", name, result)
             prices[name] = None
         else:
             prices[name] = result
@@ -206,8 +190,8 @@ def build_embed(prices, updated_at=None):
     embed = discord.Embed(
         title="💹 Canlı Piyasa Fiyatları",
         description=(
-            "Anlık fiyat tablosu\n"
-            "Otomatik güncelleme: **60 saniye**"
+            "Varlıkların son fiyatları\n"
+            "Otomatik yenileme: **60 saniye**"
         ),
         color=discord.Color.blue(),
         timestamp=updated_at,
@@ -215,7 +199,11 @@ def build_embed(prices, updated_at=None):
 
     for name in ASSET_MAP:
         price = prices.get(name)
-        value = f"**{price}**" if price else "`Veri alınamadı`"
+
+        if price is None:
+            value = "`Veri alınamadı`"
+        else:
+            value = f"**{price}**"
 
         embed.add_field(
             name=name,
@@ -224,9 +212,11 @@ def build_embed(prices, updated_at=None):
         )
 
     embed.set_footer(
-        text="Son güncelleme: "
-        + updated_at.strftime("%d.%m.%Y %H:%M:%S")
-        + " • Europe/Istanbul"
+        text=(
+            "Son güncelleme: "
+            + updated_at.strftime("%d.%m.%Y %H:%M:%S")
+            + " • Europe/Istanbul"
+        )
     )
 
     return embed
@@ -244,10 +234,10 @@ class RefreshView(discord.ui.View):
         label="Güncelle",
         emoji="🔄",
         style=discord.ButtonStyle.primary,
-        custom_id="refresh_canlidoviz_btn_v2",
+        custom_id="refresh_canlidoviz_btn_v3",
     )
     async def refresh_btn(self, interaction, button):
-        # Kullanıcıya yeni mesaj göndermez.
+        # Ephemeral yanıt veya kanala yeni mesaj gönderilmez.
         await interaction.response.defer()
 
         try:
@@ -255,22 +245,25 @@ class RefreshView(discord.ui.View):
                 prices = await fetch_all()
                 embed = build_embed(prices)
 
+                # Sadece mevcut tablo düzenlenir.
                 await interaction.message.edit(
                     embed=embed,
                     view=self,
                 )
 
         except Exception:
-            log.exception("Butonla güncelleme başarısız oldu.")
-            # Hata durumunda da kanala mesaj atılmaz.
+            log.exception("Butonla yenileme başarısız oldu.")
 
 
 # =========================================================
-# BOT
+# DISCORD BOT
 # =========================================================
 class PriceBot(discord.Client):
     def __init__(self):
-        super().__init__(intents=discord.Intents.default())
+        super().__init__(
+            intents=discord.Intents.default()
+        )
+
         self.message_id = self._load_message_id()
         self.refresh_lock = asyncio.Lock()
         self.ready_once = False
@@ -318,40 +311,59 @@ class PriceBot(discord.Client):
             try:
                 channel = await self.fetch_channel(CHANNEL_ID)
             except Exception:
-                log.exception("Discord kanalı bulunamadı.")
+                log.exception("Kanal bulunamadı.")
                 return
 
-        try:
-            prices = await fetch_all()
-            embed = build_embed(prices)
-        except Exception:
-            log.exception("İlk fiyat verileri alınamadı.")
-            embed = build_embed({name: None for name in ASSET_MAP})
-
-        view = RefreshView(self)
-
+        # Önce kayıtlı mesajı bul; varsa yeni mesaj oluşturma.
         if self.message_id:
             try:
                 message = await channel.fetch_message(self.message_id)
-                await message.edit(embed=embed, view=view)
+
+                async with self.refresh_lock:
+                    prices = await fetch_all()
+                    await message.edit(
+                        embed=build_embed(prices),
+                        view=RefreshView(self),
+                    )
+
                 log.info("Mevcut tablo düzenlendi: %s", self.message_id)
                 return
+
             except discord.NotFound:
-                log.warning("Kayıtlı mesaj silinmiş; yeni mesaj oluşturulacak.")
+                log.error(
+                    "Kayıtlı tablo bulunamadı. "
+                    "Yeni mesaj oluşturmamak için işlem durduruldu. "
+                    "MESSAGE_ID değerini kontrol et."
+                )
+                return
+
             except discord.Forbidden:
                 log.exception("Mesajı düzenleme izni yok.")
                 return
+
             except discord.HTTPException:
-                log.exception("Kayıtlı mesaj düzenlenemedi.")
+                log.exception("Mevcut mesaj düzenlenemedi.")
                 return
 
+        # İlk kurulumda MESSAGE_ID verilmediyse bir kez oluştur.
         try:
-            message = await channel.send(embed=embed, view=view)
+            prices = await fetch_all()
+            message = await channel.send(
+                embed=build_embed(prices),
+                view=RefreshView(self),
+            )
+
             self.message_id = message.id
             self._save_message_id()
-            log.info("İlk tablo mesajı oluşturuldu: %s", message.id)
+
+            log.info("İlk tablo oluşturuldu: %s", message.id)
+            log.info(
+                "Render Environment Variables bölümüne "
+                "MESSAGE_ID=%s ekle.", message.id
+            )
+
         except Exception:
-            log.exception("İlk tablo mesajı gönderilemedi.")
+            log.exception("İlk tablo oluşturulamadı.")
 
     @tasks.loop(seconds=REFRESH_SECONDS)
     async def auto_refresh(self):
@@ -367,10 +379,9 @@ class PriceBot(discord.Client):
 
                 message = await channel.fetch_message(self.message_id)
                 prices = await fetch_all()
-                embed = build_embed(prices)
 
                 await message.edit(
-                    embed=embed,
+                    embed=build_embed(prices),
                     view=RefreshView(self),
                 )
 
@@ -378,10 +389,12 @@ class PriceBot(discord.Client):
 
             except discord.NotFound:
                 log.error(
-                    "Tablo mesajı bulunamadı. MESSAGE_ID değerini kontrol et."
+                    "Tablo mesajı silinmiş veya MESSAGE_ID yanlış."
                 )
+
             except discord.Forbidden:
-                log.exception("Kanal veya mesaj için yetki eksik.")
+                log.exception("Kanal/mesaj izinleri yetersiz.")
+
             except Exception:
                 log.exception("Otomatik güncelleme başarısız.")
 
@@ -399,9 +412,9 @@ def main():
             "DISCORD_TOKEN Render Environment Variables bölümünde yok."
         )
 
-    if not BORSAPY_AVAILABLE:
+    if CHANNEL_ID == 0:
         raise RuntimeError(
-            "borsapy yüklenemedi. requirements.txt dosyasına borsapy ekle."
+            "CHANNEL_ID Render Environment Variables bölümünde yok."
         )
 
     Thread(target=run_flask, daemon=True).start()
