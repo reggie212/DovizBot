@@ -2,17 +2,16 @@ import os
 import discord
 import requests
 import asyncio
-import traceback
 from datetime import datetime
 from flask import Flask
 from threading import Thread
 
-# --- 1. RENDER 7/24 UPTIME SUNUCUSU ---
+# Render web servisi için 7/24 mini sunucu
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot aktif, oto-koruma devrede ve 7/24 calisiyor!"
+    return "Bot otomatik piyasa takibinde ve 7/24 calisiyor!"
 
 def run():
     app.run(host='0.0.0.0', port=10000)
@@ -21,7 +20,6 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-# --- 2. AYARLAR VE İNTENTLER ---
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
@@ -31,126 +29,80 @@ intents.messages = True
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# --- 3. HATA KORUMALI VERİ ÇEKME MOTORU ---
-def get_market_rates():
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+def get_fiat_rates():
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
     try:
-        # Döviz Kurları (ExchangeRate-API)
-        usd_res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", headers=headers, timeout=5).json()
-        eur_res = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", headers=headers, timeout=5).json()
-        gbp_res = requests.get("https://api.exchangerate-api.com/v4/latest/GBP", headers=headers, timeout=5).json()
+        # En sağlam ve engelsiz döviz servisi
+        res = requests.get("https://open.er-api.com/v6/latest/USD", headers=headers, timeout=5).json()
+        rates = res["rates"]
         
-        usd_try = usd_res["rates"].get("TRY", 0)
-        eur_try = eur_res["rates"].get("TRY", 0)
-        gbp_try = gbp_res["rates"].get("TRY", 0)
+        usd_try = rates.get("TRY", 0)
+        eur_to_usd = rates.get("EUR", 1)
+        gbp_to_usd = rates.get("GBP", 1)
+        chf_to_usd = rates.get("CHF", 1) # İsviçre Frangı
         
-        # Kripto Paralar (Binance API - Anlık)
-        btc_res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", headers=headers, timeout=5).json()
-        eth_res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", headers=headers, timeout=5).json()
-        
-        btc_usd = float(btc_res["price"])
-        eth_usd = float(eth_res["price"])
-        
-        btc_try = btc_usd * usd_try
-        eth_try = eth_usd * usd_try
+        eur_try = usd_try / eur_to_usd
+        gbp_try = usd_try / gbp_to_usd
+        chf_try = usd_try / chf_to_usd
         
         return {
             "USD": f"{usd_try:,.2f} TL",
             "EUR": f"{eur_try:,.2f} TL",
             "GBP": f"{gbp_try:,.2f} TL",
-            "BTC": f"{btc_try:,.2f} TL",
-            "ETH": f"{eth_try:,.2f} TL"
+            "CHF": f"{chf_try:,.2f} TL"
         }
     except Exception as e:
-        print("[HATA] Veri çekilirken sorun yaşandı:", e)
+        print("[HATA] Döviz verileri çekilemedi:", e)
         return None
 
-# --- 4. OTO-DEVAM EDEN ARKA PLAN GÖREVİ (SELF-HEALING LOOP) ---
 async def background_market_updater():
     await client.wait_until_ready()
     try:
         channel = await client.fetch_channel(CHANNEL_ID)
         print(f"[BAŞARILI] Hedef kanal bağlandı: {channel.name}")
     except Exception as e:
-        print(f"[KRİTİK HATA] Kanal bulunamadı veya yetki yok: {e}")
+        print("[KRİTİK] Kanal bulunamadı:", e)
         return
 
     while not client.is_closed():
-        try:
-            rates = get_market_rates()
-            if rates:
-                # Eski mesajları temizle
-                try:
-                    async for message in channel.history(limit=5):
-                        if message.author == client.user:
-                            await message.delete()
-                except Exception as ex:
-                    print("[BİLGİ] Eski mesajlar silinirken küçük hata:", ex)
+        rates = get_fiat_rates()
+        if rates:
+            try:
+                # Eski bot mesajlarını temizle ki alt alta yığılmasın
+                async for message in channel.history(limit=5):
+                    if message.author == client.user:
+                        await message.delete()
+            except Exception:
+                pass
 
-                # Yeni Embed Tablosu
-                embed = discord.Embed(
-                    title="📊 Canlı Piyasa ve Kripto Monitörü", 
-                    description="Güncel döviz kurları ve kripto varlık değerleri (Otomatik Güncellenir):",
-                    color=0x00ff88
-                )
-                embed.add_field(name="🇺🇸 Dolar (USD)", value=rates["USD"], inline=True)
-                embed.add_field(name="🇪🇺 Euro (EUR)", value=rates["EUR"], inline=True)
-                embed.add_field(name="🇬🇧 Sterlin (GBP)", value=rates["GBP"], inline=True)
-                embed.add_field(name="₿ Bitcoin (BTC)", value=rates["BTC"], inline=False)
-                embed.add_field(name="Ξ Ethereum (ETH)", value=rates["ETH"], inline=False)
-                
-                now = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
-                embed.set_footer(text=f"Son Güncelleme: {now} | Oto-Koruma Aktif 🚀")
-                
-                await channel.send(embed=embed)
-                print("[BİLGİ] Piyasa tablosu otomatik güncellendi.")
-            else:
-                print("[UYARI] Veriler boş döndü, bir sonraki döngü bekleniyor...")
-
-        except Exception as loop_error:
-            print("[OTO-KURTARMA] Döngüde hata yakalandı, bot çalışmaya devam ediyor:", loop_error)
+            embed = discord.Embed(
+                title="📊 Canlı Döviz ve Piyasa Monitörü", 
+                description="Güncel döviz kurları (Her 3 dakikada bir **otomatik** güncellenir):",
+                color=0x00ff88
+            )
+            embed.add_field(name="🇺🇸 Dolar (USD)", value=rates["USD"], inline=True)
+            embed.add_field(name="🇪🇺 Euro (EUR)", value=rates["EUR"], inline=True)
+            embed.add_field(name="🇬🇧 Sterlin (GBP)", value=rates["GBP"], inline=True)
+            embed.add_field(name="🇨🇭 İsviçre Frangı (CHF)", value=rates["CHF"], inline=True)
+            
+            now = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
+            embed.set_footer(text=f"Son Güncelleme: {now} | Otomatik Mod 🚀")
+            
+            await channel.send(embed=embed)
+            print("[BİLGİ] Tablo otomatik olarak güncellendi ve gönderildi.")
+        else:
+            print("[UYARI] Veriler alınamadı, bir sonraki döngü bekleniyor...")
         
-        # 3 dakika (180 saniye) bekle
+        # 3 dakikada bir otomatik yeniler
         await asyncio.sleep(180)
 
-# --- 5. EVENTLER VE KOMUTLAR ---
 @client.event
 async def on_ready():
-    print(f"[BAĞLANDI] {client.user} sistemde aktif!")
-    await client.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="!fiyat yazarak öğren 📈"))
-    # Arka plan görevini güvenli bir şekilde başlatıyoruz
+    print(f"[BAĞLANDI] {client.user} aktif!")
+    await client.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Piyasalar Otomatik Takipte 📈"))
     client.loop.create_task(background_market_updater())
 
-@client.event
-async def on_message(message):
-    if message.author == client.user:
-        return
-    
-    if message.content.lower() == "!fiyat":
-        try:
-            rates = get_market_rates()
-            if rates:
-                embed = discord.Embed(
-                    title="📊 Anlık İstenen Piyasa Verileri", 
-                    description="Komut ile anlık sorgulanan kurlar:",
-                    color=0x00aaee
-                )
-                embed.add_field(name="🇺🇸 Dolar (USD)", value=rates["USD"], inline=True)
-                embed.add_field(name="🇪🇺 Euro (EUR)", value=rates["EUR"], inline=True)
-                embed.add_field(name="🇬🇧 Sterlin (GBP)", value=rates["GBP"], inline=True)
-                embed.add_field(name="₿ Bitcoin (BTC)", value=rates["BTC"], inline=False)
-                embed.add_field(name="Ξ Ethereum (ETH)", value=rates["ETH"], inline=False)
-                
-                now = datetime.now().strftime("%H:%M:%S - %d/%m/%Y")
-                embed.set_footer(text=f"Sorgulanan Zaman: {now} | Komut İsteği 🎯")
-                
-                await message.channel.send(embed=embed)
-            else:
-                await message.channel.send("⚠️ Şu an anlık veriler çekilemedi kanka, ağ bağlantısı bekleniyor.")
-        except Exception as cmd_err:
-            print("[KOMUT HATASI]:", cmd_err)
-            await message.channel.send("⚠️ Komut işlenirken beklenmeyen bir hata oluştu.")
-
-# --- 6. BAŞLATICI ---
 keep_alive()
 client.run(TOKEN)
