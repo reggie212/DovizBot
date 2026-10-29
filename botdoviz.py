@@ -77,7 +77,7 @@ async def on_ready():
             await channel.send(embed=embed)
             print("Piyasa tablosu güncellendi!")
         
-        await asyncio.sleep(900)
+        await asyncio.sleep(180)
 
 # Web sunucusunu başlat ve botu çalıştır
 keep_alive()
