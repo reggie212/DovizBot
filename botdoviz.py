@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import logging
 from datetime import datetime
@@ -38,17 +39,17 @@ def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 # =========================================================
-# VERİ KAYNAKLARI  (sadece anlık fiyat)
+# VERİ KAYNAKLARI
 # =========================================================
 
 ASSETS = {
     "💵 USD/TRY":  "https://bigpara.hurriyet.com.tr/doviz/amerikan-dolari/",
     "💶 EUR/TRY":  "https://bigpara.hurriyet.com.tr/doviz/euro/",
     "💷 GBP/TRY":  "https://bigpara.hurriyet.com.tr/doviz/ingiliz-sterlini/",
-    "🥇 Gram Altın": "https://bigpara.hurriyet.com.tr/altin/gram-altin/",
-    "🥇 Çeyrek Altın": "https://bigpara.hurriyet.com.tr/altin/ceyrek-altin/",
-    "🥇 Yarım Altın":  "https://bigpara.hurriyet.com.tr/altin/yarim-altin/",
-    "🥇 Tam Altın":    "https://bigpara.hurriyet.com.tr/altin/tam-altin/",
+    "🪙 Gram Altın": "https://bigpara.hurriyet.com.tr/altin/gram-altin/",
+    "🪙 Çeyrek Altın": "https://bigpara.hurriyet.com.tr/altin/ceyrek-altin/",
+    "🪙 Yarım Altın":  "https://bigpara.hurriyet.com.tr/altin/yarim-altin/",
+    "🪙 Tam Altın":    "https://bigpara.hurriyet.com.tr/altin/tam-altin/",
     "📈 BIST 100":  "https://bigpara.hurriyet.com.tr/borsa/endeks/bist-100/",
 }
 
@@ -60,28 +61,51 @@ HEADERS = {
 }
 
 def _extract_price(html: str):
-    """Bigpara HTML içinden sadece anlık fiyatı çıkar."""
-    # 1) JSON-LD / script içi price alanı
-    m = re.search(r'"price"\s*:\s*"?([\d\.,]+)"?', html)
-    if m:
-        return m.group(1)
-
-    # 2) DOM seçicileri
+    """Bigpara HTML yapısına özel, çok daha isabetli fiyat çekici."""
     soup = BeautifulSoup(html, "html.parser")
-    for sel in (
-        "span.value", ".price .value", ".bigpara-value",
-        "td.value", "div.value", ".currency-value", ".kur-value",
-    ):
+
+    # 1. Meta Etiketleri (En güvenilir yöntem)
+    # Bigpara genelde <meta itemprop="price" content="34.50"> kullanır
+    meta_price = soup.find("meta", itemprop="price")
+    if meta_price and meta_price.get("content"):
+        val = meta_price["content"]
+        # Eğer nokta varsa Türkçe formata çevir (34.50 -> 34,50)
+        return val.replace(".", ",")
+
+    # 2. JSON-LD Script (Bazı sayfalarda fiyat JSON içinde gelir)
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string)
+            if isinstance(data, dict):
+                if "offers" in data and "price" in data["offers"]:
+                    return str(data["offers"]["price"]).replace(".", ",")
+                if "price" in data:
+                    return str(data["price"]).replace(".", ",")
+        except Exception:
+            pass
+
+    # 3. CSS Seçicileri (Bigpara'nın kullandığı özel sınıflar)
+    # w-doviz, w-altin, value, last-price gibi sınıflar
+    selectors = [
+        ".value", ".price", ".last-price", ".last-value",
+        ".w-doviz", ".w-altin", ".bigpara-value", 
+        "span[data-value]", ".market-value", ".table-value"
+    ]
+    for sel in selectors:
         el = soup.select_one(sel)
         if el:
-            t = el.get_text(" ", strip=True)
-            num = re.search(r"\d{1,3}(?:\.\d{3})*(?:,\d+)?|\d+(?:[.,]\d+)?", t)
+            text = el.get_text(strip=True)
+            # Sadece sayıları, noktayı ve virgülü al
+            num = re.search(r"[\d\.,]+", text)
             if num:
                 return num.group(0)
 
-    # 3) Genel fallback
-    m = re.search(r"(\d{1,3}(?:\.\d{3})*,\d+|\d+[.,]\d+)", html)
-    return m.group(1) if m else None
+    # 4. Fallback: Sayfadaki Türkçe formatlı en belirgin sayıyı bul
+    matches = re.findall(r"\b\d{1,3}(?:\.\d{3})*,\d+\b", html)
+    if matches:
+        return matches[0]
+
+    return None
 
 async def fetch_price(session, name, url):
     try:
@@ -112,8 +136,8 @@ def build_embed(prices: dict, updated_at: datetime):
         color=discord.Color.blurple(),
     )
     for name, price in prices.items():
-        # SADECE fiyat — artış / düşüş / alış / satış YOK
-        value = f"**{price}**" if price else "`—`"
+        # SADECE anlık fiyat (artış/düşüş veya alış/satış YOK)
+        value = f"**{price}**" if price else "`Veri Bekleniyor...`"
         embed.add_field(name=name, value=value, inline=True)
 
     embed.set_footer(
@@ -122,7 +146,7 @@ def build_embed(prices: dict, updated_at: datetime):
     return embed
 
 # =========================================================
-# GÜNCELLE BUTONU
+# GÜNCELLE BUTONU (Mesaj Atmaz, Sadece Tabloyu Günceller)
 # =========================================================
 
 class RefreshView(discord.ui.View):
@@ -136,11 +160,14 @@ class RefreshView(discord.ui.View):
         custom_id="refresh_prices_btn",
     )
     async def refresh_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        # ⚠️ Mesaj gönderme YOK — sadece tabloyu günceller
+        # Kullanıcıya hiçbir mesaj (ephemeral veya normal) atılmaz.
         await interaction.response.defer()
+        
         prices = await fetch_all()
         embed = build_embed(prices, datetime.now(TZ))
+        
         try:
+            # Sadece embed'i düzenle
             await interaction.message.edit(embed=embed, view=self)
         except Exception as e:
             log.warning(f"Embed düzenlenemedi: {e}")
@@ -173,7 +200,7 @@ class PriceBot(discord.Client):
 
     async def on_ready(self):
         log.info(f"Giriş yapıldı: {self.user}")
-        self.add_view(RefreshView(self))  # persistent view
+        self.add_view(RefreshView(self))  # Butonun bot yeniden başlasa bile çalışmasını sağlar
         await self.ensure_message()
         self.auto_refresh.start()
 
@@ -196,6 +223,7 @@ class PriceBot(discord.Client):
             except Exception:
                 log.info("Eski mesaj bulunamadı, yenisi oluşturuluyor…")
 
+        # Eğer kayıtlı mesaj yoksa ilk defa gönderir
         msg = await channel.send(embed=embed, view=view)
         self.message_id = msg.id
         self._save_message_id()
@@ -212,6 +240,7 @@ class PriceBot(discord.Client):
             prices = await fetch_all()
             embed = build_embed(prices, datetime.now(TZ))
             await msg.edit(embed=embed, view=RefreshView(self))
+            log.info("Otomatik güncelleme yapıldı.")
         except Exception as e:
             log.warning(f"Otomatik güncelleme hatası: {e}")
 
