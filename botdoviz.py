@@ -6,7 +6,7 @@ from datetime import datetime
 from flask import Flask
 from threading import Thread
 
-# Render web servisi için mini sunucu
+# Render web servisi için mini sunucu (7/24 aktif tutmak için)
 app = Flask('')
 
 @app.route('/')
@@ -32,17 +32,20 @@ client = discord.Client(intents=intents)
 
 def get_market_rates():
     try:
+        # API'lerin engellememesi için tarayıcı kimliği (User-Agent) ekliyoruz
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        
         # Döviz Kurları
-        usd_res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=10).json()
-        eur_res = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", timeout=10).json()
-        gbp_res = requests.get("https://api.exchangerate-api.com/v4/latest/GBP", timeout=10).json()
+        usd_res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", headers=headers, timeout=10).json()
+        eur_res = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", headers=headers, timeout=10).json()
+        gbp_res = requests.get("https://api.exchangerate-api.com/v4/latest/GBP", headers=headers, timeout=10).json()
         
         usd_try = usd_res["rates"].get("TRY", 0)
         eur_try = eur_res["rates"].get("TRY", 0)
         gbp_try = gbp_res["rates"].get("TRY", 0)
         
         # Kripto Paralar (BTC ve ETH)
-        crypto_res = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd", timeout=10).json()
+        crypto_res = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd", headers=headers, timeout=10).json()
         btc_usd = crypto_res["bitcoin"]["usd"]
         ethereum_usd = crypto_res["ethereum"]["usd"]
         
@@ -64,7 +67,7 @@ def get_market_rates():
 async def on_ready():
     print(f"{client.user} olarak giriş yapıldı ve bot aktif!")
     
-    # Botun Discord durum mesajını ayarlayalım
+    # Botun Discord durum mesajı
     await client.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="!fiyat yazarak öğren 📈"))
     
     try:
@@ -85,7 +88,7 @@ async def on_ready():
             except Exception as e:
                 print("Eski mesajlar temizlenirken hata:", e)
 
-            # Şık bir Embed tasarımı
+            # Şık Embed tasarımı
             embed = discord.Embed(
                 title="📊 Canlı Piyasa ve Kripto Monitörü", 
                 description="Güncel döviz kurları ve kripto varlık değerleri (Her 3 dakikada bir güncellenir):",
@@ -106,14 +109,12 @@ async def on_ready():
         # 180 saniye (3 dakika) bekle
         await asyncio.sleep(180)
 
-# YENİ ÖZELLİK: Chat'e !fiyat yazıldığında anında cevap verme komutu
+# Chat'e !fiyat yazıldığında anında cevap verme komutu
 @client.event
 async def on_message(message):
-    # Botun kendi mesajlarına tepki vermesini engelle
     if message.author == client.user:
         return
     
-    # Kullanıcı "!fiyat" yazdığında çalışır
     if message.content.lower() == "!fiyat":
         rates = get_market_rates()
         if rates:
