@@ -32,25 +32,26 @@ client = discord.Client(intents=intents)
 
 def get_market_rates():
     try:
-        # API'lerin engellememesi için tarayıcı kimliği (User-Agent) ekliyoruz
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         
-        # Döviz Kurları
-        usd_res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", headers=headers, timeout=10).json()
-        eur_res = requests.get("https://api.exchangerate-api.com/v4/latest/EUR", headers=headers, timeout=10).json()
-        gbp_res = requests.get("https://api.exchangerate-api.com/v4/latest/GBP", headers=headers, timeout=10).json()
+        # Döviz Kurları (Frankfurter API - Kesintisiz ve güncel)
+        usd_res = requests.get("https://api.frankfurter.app/latest?from=USD&to=TRY", headers=headers, timeout=10).json()
+        eur_res = requests.get("https://api.frankfurter.app/latest?from=EUR&to=TRY", headers=headers, timeout=10).json()
+        gbp_res = requests.get("https://api.frankfurter.app/latest?from=GBP&to=TRY", headers=headers, timeout=10).json()
         
-        usd_try = usd_res["rates"].get("TRY", 0)
-        eur_try = eur_res["rates"].get("TRY", 0)
-        gbp_try = gbp_res["rates"].get("TRY", 0)
+        usd_try = usd_res["rates"]["TRY"]
+        eur_try = eur_res["rates"]["TRY"]
+        gbp_try = gbp_res["rates"]["TRY"]
         
-        # Kripto Paralar (BTC ve ETH)
-        crypto_res = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd", headers=headers, timeout=10).json()
-        btc_usd = crypto_res["bitcoin"]["usd"]
-        ethereum_usd = crypto_res["ethereum"]["usd"]
+        # Kripto Paralar (Binance API - Saniyelik anlık veriler)
+        btc_res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", headers=headers, timeout=10).json()
+        eth_res = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", headers=headers, timeout=10).json()
+        
+        btc_usd = float(btc_res["price"])
+        eth_usd = float(eth_res["price"])
         
         btc_try = btc_usd * usd_try
-        eth_try = ethereum_usd * usd_try
+        eth_try = eth_usd * usd_try
         
         return {
             "USD": f"{usd_try:,.2f} TL",
