@@ -1,68 +1,86 @@
 
 import os
+import re
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from threading import Thread
 
 import aiohttp
 import discord
+from bs4 import BeautifulSoup
 from flask import Flask
-from threading import Thread
+from discord.ext import tasks
 
-# ==================================================
-# DEXAR MARKET MONITOR
-# ==================================================
+# =========================================================
+# AYARLAR
+# =========================================================
 
-BOT_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID")
+TOKEN = os.getenv("DISCORD_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
 
-API_URL = "https://open.er-api.com/v6/latest/USD"
-UPDATE_INTERVAL = 900  # 15 dakikada bir kontrol
-MESSAGE_TITLE = "📊 DEXAR | Döviz Piyasası"
+SOURCE_URL = "https://bigpara.hurriyet.com.tr/doviz/"
+UPDATE_SECONDS = 120
+BUTTON_COOLDOWN = 15
+TZ = ZoneInfo("Europe/Istanbul")
+TITLE = "💱 Canlı Döviz Kurları"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
-log = logging.getLogger("dexar-market")
+log = logging.getLogger("currency-monitor")
 
-if not BOT_TOKEN:
-    raise RuntimeError("DISCORD_TOKEN ortam değişkeni eksik!")
+if not TOKEN or CHANNEL_ID <= 0:
+    raise RuntimeError(
+        "DISCORD_TOKEN ve CHANNEL_ID ortam değişkenlerini ayarla."
+    )
 
-if not CHANNEL_ID_RAW:
-    raise RuntimeError("CHANNEL_ID ortam değişkeni eksik!")
+# Bigpara'da gösterilen yaygın dövizler
+CURRENCIES = [
+    ("USD", "🇺🇸", "Dolar", ("dolar",)),
+    ("EUR", "🇪🇺", "Euro", ("euro",)),
+    ("GBP", "🇬🇧", "İngiliz Sterlini", ("sterlin",)),
+    ("CHF", "🇨🇭", "İsviçre Frangı", ("isviçre frangı",)),
+    ("JPY", "🇯🇵", "Japon Yeni", ("japon yeni",)),
+    ("SAR", "🇸🇦", "Suudi Arabistan Riyali", ("suudi arabistan riyali",)),
+    ("NOK", "🇳🇴", "Norveç Kronu", ("norveç kronu",)),
+    ("DKK", "🇩🇰", "Danimarka Kronu", ("danimarka kronu",)),
+    ("AUD", "🇦🇺", "Avustralya Doları", ("avustralya doları",)),
+    ("CAD", "🇨🇦", "Kanada Doları", ("kanada doları",)),
+    ("SEK", "🇸🇪", "İsveç Kronu", ("isveç kronu",)),
+    ("RUB", "🇷🇺", "Rus Rublesi", ("rus rublesi", "rublesi")),
+    ("KWD", "🇰🇼", "Kuveyt Dinarı", ("kuveyt dinarı",)),
+    ("CNY", "🇨🇳", "Çin Yuanı", ("çin yuanı", "yuanı")),
+    ("AED", "🇦🇪", "BAE Dirhemi", ("bae dirhemi", "dirhemi")),
+]
 
-try:
-    CHANNEL_ID = int(CHANNEL_ID_RAW)
-except ValueError:
-    raise RuntimeError("CHANNEL_ID sayısal bir Discord kanal ID'si olmalı!")
+# =========================================================
+# WEB SAĞLIK KONTROLÜ
+# =========================================================
 
-# ==================================================
-# RENDER HEALTH CHECK
-# ==================================================
-
-app = Flask(__name__)
+web = Flask(__name__)
 
 
-@app.route("/")
+@web.route("/")
 def home():
     return {
-        "bot": "DEXAR Market Monitor",
+        "service": "Currency Monitor",
         "status": "running",
-        "data_type": "Daily reference exchange rates",
-        "check_interval_seconds": UPDATE_INTERVAL
+        "source": SOURCE_URL,
+        "interval_seconds": UPDATE_SECONDS
     }
 
 
-@app.route("/health")
+@web.route("/health")
 def health():
     return {"status": "ok"}, 200
 
 
 def run_web():
-    app.run(
+    web.run(
         host="0.0.0.0",
         port=PORT,
         debug=False,
@@ -70,361 +88,560 @@ def run_web():
     )
 
 
-def keep_alive():
-    Thread(target=run_web, daemon=True).start()
+# =========================================================
+# SAYISAL VERİ İŞLEME
+# =========================================================
 
+def parse_number(text):
+    """Türkçe ve İngilizce ondalık gösterimlerini dönüştürür."""
+    if not text:
+        return None
 
-# ==================================================
-# DISCORD
-# ==================================================
+    value = (
+        str(text)
+        .replace("\xa0", "")
+        .replace("₺", "")
+        .replace("TL", "")
+        .replace("%", "")
+        .replace(" ", "")
+        .strip()
+    )
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.messages = True
+    if not re.fullmatch(r"[+-]?\d[\d.,]*", value):
+        return None
 
-client = discord.Client(intents=intents)
+    # Türkçe gösterim: 49.789,20
+    if "," in value and "." in value:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "").replace(",", ".")
+        else:
+            value = value.replace(",", "")
 
-http_session = None
-updater_task = None
-status_message = None
-
-
-# ==================================================
-# FORMAT HELPERS
-# ==================================================
-
-def format_tl(value):
-    """Türkçe sayı görünümü: 42.123,45 TL"""
-    formatted = f"{value:,.2f}"
-    formatted = formatted.replace(",", "_")
-    formatted = formatted.replace(".", ",")
-    formatted = formatted.replace("_", ".")
-    return f"{formatted} TL"
-
-
-def turkey_time():
-    return datetime.now(
-        ZoneInfo("Europe/Istanbul")
-    ).strftime("%d.%m.%Y %H:%M:%S")
-
-
-# ==================================================
-# RATE PROVIDER
-# ==================================================
-
-async def get_fiat_rates():
-    global http_session
+    elif "," in value:
+        value = value.replace(",", ".")
 
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
+        return float(value)
+    except ValueError:
+        return None
 
-        async with http_session.get(
-            API_URL,
-            timeout=timeout,
-            headers={"Accept": "application/json"}
-        ) as response:
 
+def fmt(value, digits=4):
+    if value is None:
+        return "—"
+
+    return (
+        f"{value:,.{digits}f}"
+        .replace(",", "X")
+        .replace(".", ",")
+        .replace("X", ".")
+    )
+
+
+def fmt_percent(value):
+    if value is None:
+        return "—"
+
+    sign = "+" if value > 0 else ""
+    return f"{sign}{fmt(value, 2)}%"
+
+
+def normalized(text):
+    text = str(text).casefold()
+    return (
+        text.replace("ı", "i")
+        .replace("İ", "i")
+        .replace("ş", "s")
+        .replace("ğ", "g")
+        .replace("ü", "u")
+        .replace("ö", "o")
+        .replace("ç", "c")
+    )
+
+
+def identify_currency(text):
+    text = normalized(text)
+
+    # Önce uzun ve ayırt edici isimler
+    for code, flag, name, aliases in CURRENCIES:
+        if any(normalized(alias) in text for alias in aliases):
+            return code
+
+    return None
+
+
+# =========================================================
+# BIGPARA SAYFA OKUYUCU
+# =========================================================
+
+async def fetch_bigpara():
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
+        ),
+        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.7",
+        "Cache-Control": "no-cache",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=25)
+
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout
+    ) as session:
+        async with session.get(SOURCE_URL) as response:
             response.raise_for_status()
-            data = await response.json(content_type=None)
+            html = await response.text()
 
-        if data.get("result") != "success":
-            raise ValueError(
-                f"API başarısız yanıt verdi: {data.get('result')}"
-            )
+    soup = BeautifulSoup(html, "html.parser")
+    page_text = soup.get_text(" ", strip=True)
 
-        rates = data.get("rates")
+    if len(page_text) < 500:
+        raise ValueError("Bigpara sayfası eksik veya boş geldi.")
 
-        if not isinstance(rates, dict):
-            raise ValueError("API kur tablosu geçersiz.")
+    # Sayfa son güncelleme zamanı
+    source_update = None
+    update_match = re.search(
+        r"Son Güncelleme\s*"
+        r"(\d{1,2}\s+\w+\s*,?\s*\d{1,2}:\d{2}(?::\d{2})?)",
+        page_text,
+        flags=re.IGNORECASE
+    )
 
-        usd_try = rates.get("TRY")
-        eur_usd = rates.get("EUR")
-        gbp_usd = rates.get("GBP")
-        chf_usd = rates.get("CHF")
+    if update_match:
+        source_update = update_match.group(1)
 
-        values = [usd_try, eur_usd, gbp_usd, chf_usd]
+    result = {}
 
-        if any(
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or value <= 0
-            for value in values
-        ):
-            raise ValueError("Eksik veya geçersiz döviz verisi.")
+    # Sayfa tablolarındaki satırları tara
+    for row in soup.select("tr"):
+        cells = row.find_all(["th", "td"], recursive=False)
 
-        # API: 1 USD kaç birim para ediyor?
-        # Çapraz kur: TRY / ilgili para biriminin USD karşılığı
-        eur_try = usd_try / eur_usd
-        gbp_try = usd_try / gbp_usd
-        chf_try = usd_try / chf_usd
+        if len(cells) < 2:
+            continue
 
-        result = {
-            "USD": usd_try,
-            "EUR": eur_try,
-            "GBP": gbp_try,
-            "CHF": chf_try,
-            "source_date": data.get("time_last_update_utc", "Bilinmiyor"),
-            "next_update": data.get("time_next_update_utc", "Bilinmiyor"),
-        }
-
-        log.info(
-            "Kur verisi alındı. Kaynak güncellemesi: %s",
-            result["source_date"]
+        row_text = " ".join(
+            cell.get_text(" ", strip=True) for cell in cells
         )
 
-        return result
+        code = identify_currency(row_text)
 
-    except (
-        aiohttp.ClientError,
-        asyncio.TimeoutError,
-        ValueError,
-        KeyError,
-        TypeError
-    ) as error:
-        log.exception("Kur verisi alınamadı: %s", error)
-        return None
+        if not code:
+            continue
 
-    except Exception:
-        log.exception("Beklenmeyen API hatası.")
-        return None
+        # Her hücreyi ayrı okumak sütun sırasını korur.
+        # Fiyat, yüzde değişim, fark, alış, satış,
+        # günlük yüksek, günlük düşük beklenir.
+        numeric_cells = []
 
+        for cell in cells:
+            cell_text = cell.get_text(" ", strip=True)
 
-# ==================================================
-# EMBED
-# ==================================================
+            # Yüzde değerleri dahil, hücredeki ilk sayı
+            match = re.search(
+                r"(?<!\w)[+-]?\d[\d.,]*(?:\s*%)?",
+                cell_text
+            )
 
-def create_market_embed(rates, error=None):
-    now = turkey_time()
+            if match:
+                numeric_cells.append(
+                    parse_number(match.group(0))
+                )
+            else:
+                numeric_cells.append(None)
 
-    if rates is None:
-        embed = discord.Embed(
-            title=MESSAGE_TITLE,
-            description=(
-                "⚠️ **Veri sağlayıcısına ulaşılamadı.**\n\n"
-                "Yeni kur verisi doğrulanamadı. "
-                "Eski fiyatlar güncelmiş gibi gösterilmiyor.\n"
-                "Bot otomatik olarak tekrar deneyecek."
+        # Para adı genellikle ilk sütundadır. Sayısal
+        # sütunların başlangıcını tespit et.
+        first_numeric = next(
+            (
+                i for i, cell in enumerate(cells)
+                if parse_number(
+                    re.sub(
+                        r"%",
+                        "",
+                        cell.get_text(" ", strip=True)
+                    )
+                ) is not None
             ),
-            color=0xFF4545,
-            timestamp=datetime.now(ZoneInfo("UTC"))
+            None
+        )
+
+        if first_numeric is None:
+            continue
+
+        values = numeric_cells[first_numeric:]
+
+        # Fiyat ve yüzde değişim en azından bulunmalı.
+        # Eksik hücreler uydurulmaz.
+        while values and values[-1] is None:
+            values.pop()
+
+        if not values or values[0] is None:
+            continue
+
+        price = values[0]
+
+        # Sütunlar Bigpara tablosunun gerçek sırasına
+        # göre yorumlanır. Alan yoksa None kalır.
+        change = values[1] if len(values) > 1 else None
+        difference = values[2] if len(values) > 2 else None
+        buy = values[3] if len(values) > 3 else None
+        sell = values[4] if len(values) > 4 else None
+        high = values[5] if len(values) > 5 else None
+        low = values[6] if len(values) > 6 else None
+
+        # Bozuk satırı kabul etme.
+        if price <= 0:
+            continue
+
+        # Aynı para birimi birden fazla tabloda bulunursa
+        # ilk geçerli serbest piyasa satırını koru.
+        if code not in result:
+            result[code] = {
+                "price": price,
+                "change": change,
+                "difference": difference,
+                "buy": buy,
+                "sell": sell,
+                "high": high,
+                "low": low,
+                "row_text": row_text[:300],
+            }
+
+    if len(result) < 3:
+        raise ValueError(
+            "Bigpara tablosundan yeterli kur okunamadı. "
+            "HTML yapısı değişmiş veya erişim engellenmiş olabilir."
+        )
+
+    return {
+        "rates": result,
+        "source_update": source_update,
+        "fetched_at": datetime.now(TZ),
+    }
+
+
+# =========================================================
+# DISCORD EMBED
+# =========================================================
+
+def make_embed(snapshot=None, error=None):
+    now = datetime.now(TZ)
+
+    if snapshot is None:
+        embed = discord.Embed(
+            title=TITLE,
+            description=(
+                "⚠️ **Bigpara verisi alınamadı.**\n\n"
+                "Yeni fiyatlar doğrulanamadığı için eski veriler "
+                "güncelmiş gibi gösterilmiyor.\n"
+                "Güncelle butonunu daha sonra tekrar deneyebilirsin."
+            ),
+            color=0xE74C3C,
+            timestamp=datetime.now(timezone.utc)
         )
 
         embed.add_field(
             name="Son kontrol",
-            value=now,
-            inline=False
-        )
-
-        if error:
-            embed.add_field(
-                name="Durum",
-                value="Bağlantı veya veri doğrulama hatası",
-                inline=False
-            )
-
-    else:
-        embed = discord.Embed(
-            title=MESSAGE_TITLE,
-            description=(
-                "💱 **Döviz kurları / TL**\n"
-                "Kaynak: ExchangeRate-API\n"
-                "[Kaynağı aç](https://www.exchangerate-api.com/)"
-            ),
-            color=0x00D68F,
-            timestamp=datetime.now(ZoneInfo("UTC"))
-        )
-
-        currencies = [
-            ("🇺🇸 Dolar (USD/TRY)", "USD"),
-            ("🇪🇺 Euro (EUR/TRY)", "EUR"),
-            ("🇬🇧 Sterlin (GBP/TRY)", "GBP"),
-            ("🇨🇭 İsviçre Frangı (CHF/TRY)", "CHF"),
-        ]
-
-        for label, key in currencies:
-            embed.add_field(
-                name=label,
-                value=f"**{format_tl(rates[key])}**",
-                inline=True
-            )
-
-        embed.add_field(
-            name="📅 Kaynağın son veri güncellemesi",
-            value=str(rates["source_date"]),
+            value=now.strftime("%d.%m.%Y %H:%M:%S"),
             inline=False
         )
 
         embed.add_field(
-            name="🔄 Kaynağın sonraki güncelleme zamanı",
-            value=str(rates["next_update"]),
+            name="Hata",
+            value=(error or "Veri alınamadı")[:900],
             inline=False
         )
 
         embed.add_field(
-            name="🕒 Botun son kontrolü (Türkiye)",
-            value=now,
+            name="Kaynak",
+            value=f"[Bigpara Döviz Sayfası]({SOURCE_URL})",
             inline=False
         )
 
-        embed.add_field(
-            name="📡 Veri tipi",
-            value="Günlük referans kuru — anlık alış/satış fiyatı değildir.",
-            inline=False
+        return embed
+
+    rates = snapshot["rates"]
+
+    embed = discord.Embed(
+        title=TITLE,
+        url=SOURCE_URL,
+        description=(
+            "📈 **Serbest piyasa döviz tablosu**\n"
+            "Kaynak: Bigpara / Hürriyet\n"
+            "Fiyatlar kaynak sayfadan okunur; çapraz kur hesaplanmaz."
+        ),
+        color=0x20C997,
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    for code, flag, name, aliases in CURRENCIES:
+        data = rates.get(code)
+
+        if not data:
+            continue
+
+        change = data["change"]
+        color_icon = (
+            "🟢" if change is not None and change > 0
+            else "🔴" if change is not None and change < 0
+            else "⚪"
         )
+
+        value = (
+            f"**Fiyat:** {fmt(data['price'])} TL\n"
+            f"**Değişim:** {color_icon} {fmt_percent(change)}\n"
+            f"**Alış:** {fmt(data['buy'])} TL\n"
+            f"**Satış:** {fmt(data['sell'])} TL\n"
+            f"**Günlük yüksek:** {fmt(data['high'])} TL\n"
+            f"**Günlük düşük:** {fmt(data['low'])} TL"
+        )
+
+        embed.add_field(
+            name=f"{flag} {name} ({code})",
+            value=value,
+            inline=True
+        )
+
+    embed.add_field(
+        name="🕒 Kaynak güncelleme zamanı",
+        value=snapshot["source_update"] or (
+            "Sayfada güncelleme zamanı bulunamadı"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔄 Botun kontrol zamanı",
+        value=snapshot["fetched_at"].strftime(
+            "%d.%m.%Y %H:%M:%S"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="⏱️ Otomatik kontrol",
+        value=f"{UPDATE_SECONDS} saniyede bir",
+        inline=True
+    )
+
+    embed.add_field(
+        name="⚠️ Bilgilendirme",
+        value=(
+            "Kontrol saati, fiyatların o anda değiştiği anlamına gelmez. "
+            "Güncellik Bigpara'nın kendi veri akışına bağlıdır. "
+            "Alış ve satış fiyatları kaynakta bulunmuyorsa — gösterilir."
+        ),
+        inline=False
+    )
 
     embed.set_footer(
-        text="DEXAR MARKET • Otomatik takip sistemi"
+        text="Kaynak verisi • Otomatik kontrol • Manuel yenileme"
     )
 
     return embed
 
 
-# ==================================================
-# SINGLE MESSAGE MANAGEMENT
-# ==================================================
+# =========================================================
+# BOT VE MESAJ YÖNETİMİ
+# =========================================================
 
-async def find_existing_message(channel):
-    """Botun eski piyasa mesajını bulur; kanal geçmişini silmez."""
-    try:
-        async for message in channel.history(limit=100):
-            if message.author != client.user:
-                continue
+intents = discord.Intents.default()
+client = discord.Client(intents=intents)
 
-            if not message.embeds:
-                continue
-
-            if message.embeds[0].title == MESSAGE_TITLE:
-                log.info("Önceki piyasa mesajı bulundu: %s", message.id)
-                return message
-
-    except discord.Forbidden:
-        log.error(
-            "Mesaj geçmişi okunamıyor. Read Message History izni gerekli."
-        )
-    except discord.HTTPException:
-        log.exception("Eski mesaj aranırken Discord hatası.")
-
-    return None
+market_message = None
+update_lock = asyncio.Lock()
+last_button_time = 0.0
 
 
-async def publish_or_edit(channel, embed):
-    global status_message
-
-    try:
-        if status_message is not None:
-            await status_message.edit(embed=embed)
-        else:
-            status_message = await find_existing_message(channel)
-
-            if status_message is not None:
-                await status_message.edit(embed=embed)
-            else:
-                status_message = await channel.send(embed=embed)
-
-        log.info("Piyasa mesajı başarıyla güncellendi.")
-
-    except discord.NotFound:
-        status_message = await channel.send(embed=embed)
-        log.info("Silinmiş mesajın yerine yeni mesaj oluşturuldu.")
-
-    except discord.Forbidden:
-        log.error(
-            "Botun mesaj gönderme veya düzenleme izni yok."
-        )
-        raise
-
-    except discord.HTTPException:
-        log.exception("Discord mesaj işlemi başarısız.")
-        raise
-
-
-# ==================================================
-# BACKGROUND UPDATER
-# ==================================================
-
-async def background_market_updater():
-    global http_session
-
-    await client.wait_until_ready()
-
+async def get_channel():
     channel = client.get_channel(CHANNEL_ID)
 
     if channel is None:
-        try:
-            channel = await client.fetch_channel(CHANNEL_ID)
-        except discord.HTTPException:
-            log.exception("Kanal bulunamadı veya erişilemiyor.")
-            return
+        channel = await client.fetch_channel(CHANNEL_ID)
 
     if not hasattr(channel, "send"):
-        log.error("Verilen kanal mesaj gönderilebilir bir kanal değil.")
-        return
+        raise RuntimeError("Bu Discord kanalı mesaj kabul etmiyor.")
 
-    log.info("Piyasa takip sistemi başladı.")
+    return channel
 
-    async with aiohttp.ClientSession() as session:
-        http_session = session
 
-        while not client.is_closed():
+async def find_market_message(channel):
+    global market_message
+
+    known_titles = {
+        TITLE,
+        "📊 Canlı Döviz ve Piyasa Monitörü",
+        "📊 DEXAR | Döviz Piyasası",
+        "💱 Döviz Piyasası",
+    }
+
+    try:
+        async for message in channel.history(limit=100):
+            if message.author != client.user or not message.embeds:
+                continue
+
+            if message.embeds[0].title not in known_titles:
+                continue
+
+            if market_message is None:
+                market_message = message
+            elif message.id != market_message.id:
+                # Yalnızca eski bot mesajlarını temizle.
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    log.warning("Eski mesaj silinemedi: %s", message.id)
+
+    except discord.Forbidden:
+        log.warning(
+            "Read Message History izni yok; eski mesaj bulunamayabilir."
+        )
+
+    return market_message
+
+
+async def publish(snapshot=None, error=None):
+    global market_message
+
+    channel = await get_channel()
+    await find_market_message(channel)
+
+    embed = make_embed(snapshot, error)
+    view = MarketView()
+
+    if market_message is None:
+        market_message = await channel.send(embed=embed, view=view)
+    else:
+        try:
+            await market_message.edit(embed=embed, view=view)
+        except discord.NotFound:
+            market_message = await channel.send(embed=embed, view=view)
+
+    log.info("Mesaj güncellendi.")
+
+
+# =========================================================
+# GÜNCELLE BUTONU
+# =========================================================
+
+class MarketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Güncelle",
+        emoji="🔄",
+        style=discord.ButtonStyle.primary,
+        custom_id="currency_refresh_button"
+    )
+    async def refresh(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        global last_button_time
+
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+
+        if now - last_button_time < BUTTON_COOLDOWN:
+            remaining = max(
+                1, int(BUTTON_COOLDOWN - (now - last_button_time))
+            )
+
+            await interaction.response.send_message(
+                f"Tekrar denemeden önce {remaining} saniye bekle.",
+                ephemeral=True
+            )
+            return
+
+        last_button_time = now
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            async with update_lock:
+                snapshot = await fetch_bigpara()
+                await publish(snapshot)
+
+            await interaction.followup.send(
+                "Bigpara kontrolü tamamlandı. Mesajdaki kaynak zamanını kontrol et.",
+                ephemeral=True
+            )
+
+        except Exception as exc:
+            log.exception("Manuel yenileme başarısız.")
+
             try:
-                rates = await get_fiat_rates()
-
-                embed = create_market_embed(
-                    rates,
-                    error=None if rates else "Veri alınamadı"
-                )
-
-                await publish_or_edit(channel, embed)
-
-            except asyncio.CancelledError:
-                raise
-
+                await publish(error=str(exc))
             except Exception:
-                log.exception(
-                    "Güncelleme döngüsünde hata; yeniden denenecek."
-                )
+                log.exception("Hata mesajı güncellenemedi.")
 
-            await asyncio.sleep(UPDATE_INTERVAL)
+            await interaction.followup.send(
+                "Veri alınamadı. Bot loglarını kontrol et.",
+                ephemeral=True
+            )
 
 
-# ==================================================
-# STARTUP
-# ==================================================
+# =========================================================
+# OTOMATİK GÜNCELLEME
+# =========================================================
+
+@tasks.loop(seconds=UPDATE_SECONDS)
+async def automatic_update():
+    try:
+        async with update_lock:
+            snapshot = await fetch_bigpara()
+            await publish(snapshot)
+
+    except Exception as exc:
+        log.exception("Otomatik güncelleme başarısız.")
+
+        try:
+            await publish(error=str(exc))
+        except Exception:
+            log.exception("Hata durumu Discord'a yazılamadı.")
+
+
+@automatic_update.before_loop
+async def before_automatic_update():
+    await client.wait_until_ready()
+
 
 @client.event
 async def on_ready():
-    global updater_task
+    log.info("Bot bağlandı: %s", client.user)
 
-    log.info("Discord bağlantısı kuruldu: %s", client.user)
+    client.add_view(MarketView())
 
     await client.change_presence(
         activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name="Döviz piyasası 📈"
+            name="Döviz kurları"
         )
     )
 
-    # Yeniden bağlantıda ikinci bir döngü başlatma.
-    if updater_task is None or updater_task.done():
-        updater_task = asyncio.create_task(
-            background_market_updater()
-        )
+    if not automatic_update.is_running():
+        automatic_update.start()
 
 
-@client.event
-async def on_disconnect():
-    log.warning("Discord bağlantısı kesildi; yeniden bağlanma bekleniyor.")
-
+# =========================================================
+# BAŞLAT
+# =========================================================
 
 async def main():
-    keep_alive()
+    Thread(target=run_web, daemon=True).start()
 
     async with client:
-        await client.start(BOT_TOKEN)
+        await client.start(TOKEN)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Bot kapatıldı.")
+    asyncio.run(main())
